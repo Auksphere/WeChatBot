@@ -1,0 +1,6 @@
+name: astrbot_plugin_personal_companion
+display_name: 大肥鱼跨群记忆与附件
+desc: 按真实微信ID保存本人资料，读取常见文档并分析视频画面和语音。
+version: v0.2.4
+author: Local
+repo: ""

@@ -1,0 +1,3 @@
+# The manager uses stdlib HTTP. These are used by the existing runtime adapters.
+psutil>=7,<8
+Pillow>=11,<13

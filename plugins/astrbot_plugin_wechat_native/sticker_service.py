@@ -1,0 +1,910 @@
+"""Sticker resources tied to the current trusted message and Native account."""
+
+import asyncio
+import hashlib
+import json
+import re
+import time
+import uuid
+
+from astrbot.api import logger
+
+from .config import MAX_IMAGE_BYTES
+from .event import sticker_preview
+from .native_client import (
+    _SAFE_CODES,
+    MediaError,
+    NativeAPIError,
+    NativeClient,
+    SendError,
+    _extract_job_error_code,
+)
+from .state import clean_sticker_caption
+from .tool_support import ToolError, context, is_tool_error, result
+
+
+def source_hash(value):
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def is_sticker(raw):
+    return isinstance(raw, dict) and (
+        raw.get("type") == 47 or (raw.get("type") == 49 and raw.get("appMessageType") == 8)
+    )
+
+
+def quoted_sticker(raw):
+    return (
+        isinstance(raw, dict)
+        and raw.get("type") == 49
+        and raw.get("appMessageType") == 57
+        and is_sticker(raw.get("quote"))
+        and raw["quote"].get("state") == "embedded"
+        and raw["quote"].get("embeddedSticker") is True
+    )
+
+
+def missing_sticker_quote(raw):
+    quote = raw.get("quote") if isinstance(raw, dict) else None
+    return (
+        isinstance(raw, dict)
+        and raw.get("type") == 49
+        and raw.get("appMessageType") == 57
+        and is_sticker(quote)
+        and quote.get("state") == "missing"
+        and isinstance(quote.get("serverId"), str)
+        and bool(quote["serverId"])
+        and isinstance(quote.get("senderId"), str)
+        and bool(quote["senderId"])
+    )
+
+
+def quoted_sticker_candidate(raw):
+    return quoted_sticker(raw) or missing_sticker_quote(raw)
+
+
+class StickerService:
+    def __init__(self, adapter):
+        self.adapter = adapter
+
+    async def _check_original_message(self, raw, original_id):
+        adapter = self.adapter
+        quote = raw.get("quote")
+        if (
+            not isinstance(quote, dict)
+            or not isinstance(original_id, str)
+            or not original_id
+            or adapter.state.message_status(original_id) == "recalled"
+            or adapter.state.is_recalled(raw["threadId"], quote.get("serverId"))
+        ):
+            raise MediaError(
+                "recalled"
+                if isinstance(quote, dict)
+                and (
+                    adapter.state.message_status(original_id) == "recalled"
+                    or adapter.state.is_recalled(raw["threadId"], quote.get("serverId"))
+                )
+                else "unavailable",
+                media_kind="sticker",
+            )
+        original = await adapter.client.message(original_id)
+        if (
+            not isinstance(original, dict)
+            or original.get("id") != original_id
+            or original.get("accountId") != adapter.native_config.account_id
+            or original.get("threadId") != raw["threadId"]
+            or original.get("serverId") != quote.get("serverId")
+            or original.get("senderId") != quote.get("senderId")
+            or not is_sticker(original)
+            or original.get("type") != quote.get("type")
+            or (
+                quote.get("type") == 49
+                and original.get("appMessageType") != quote.get("appMessageType")
+            )
+        ):
+            raise MediaError("unavailable", media_kind="sticker")
+        if original.get("recall") is not None:
+            raise MediaError("recalled", media_kind="sticker")
+
+    async def _check_direct_message(self, raw):
+        adapter=self.adapter
+        cfg=adapter.native_config
+        sender,thread=raw.get('senderId'),raw.get('threadId')
+        if (raw.get('accountId')!=cfg.account_id or raw.get('direction')!='incoming'
+                or not cfg.enable_media or not cfg.enable_stickers or not cfg.enable_private_reply
+                or not isinstance(sender,str) or not sender or sender==adapter.bot_self_id or thread!=sender
+                or thread.endswith('@chatroom') or (cfg.allowed_users and sender not in cfg.allowed_users)
+                or not is_sticker(raw)):
+            raise MediaError('unavailable',media_kind='sticker')
+        if (raw.get('recall') is not None or adapter.state.message_status(raw['id'])=='recalled'
+                or adapter.state.is_recalled(thread,raw.get('serverId'))):
+            raise MediaError('recalled',media_kind='sticker')
+        current=await adapter.client.message(raw['id'])
+        if (not isinstance(current,dict) or any(current.get(k)!=raw.get(k)
+                for k in ('id','accountId','threadId','serverId','senderId','type','appMessageType','direction'))
+                or not is_sticker(current)):
+            raise MediaError('unavailable',media_kind='sticker')
+        if current.get('recall') is not None:raise MediaError('recalled',media_kind='sticker')
+
+    async def _resolve_quote_source(self, raw):
+        if is_sticker(raw):
+            await self._check_direct_message(raw)
+            return raw["id"], False
+        if quoted_sticker(raw):
+            return raw["id"], True
+        if not missing_sticker_quote(raw):
+            raise MediaError(
+                "recalled"
+                if isinstance(raw.get("quote"), dict) and raw["quote"].get("state") == "recalled"
+                else "unavailable",
+                media_kind="sticker",
+            )
+        quote = raw["quote"]
+        thread = raw["threadId"]
+        if self.adapter.state.is_recalled(thread, quote["serverId"]):
+            raise MediaError("recalled", media_kind="sticker")
+        original_id = self.adapter.state.find_message_id(thread, quote["serverId"])
+        if not original_id:
+            listing = await self.adapter.client.messages(thread, limit=50)
+            items = listing.get("items") if isinstance(listing, dict) else None
+            if isinstance(items, list):
+                matches = [
+                    item
+                    for item in items
+                    if isinstance(item, dict) and item.get("serverId") == quote["serverId"]
+                ]
+                if len(matches) == 1 and isinstance(matches[0].get("id"), str) and matches[0]["id"]:
+                    original_id = matches[0]["id"]
+        if not original_id:
+            raise MediaError("unavailable", media_kind="sticker")
+        await self._check_original_message(raw, original_id)
+        return original_id, False
+
+    async def check_quote(self, raw, *, source_message_id=None):
+        if is_sticker(raw):
+            if source_message_id and source_message_id!=raw.get('id'):
+                raise MediaError('unavailable',media_kind='sticker')
+            await self._check_direct_message(raw)
+            return
+        adapter = self.adapter
+        if (
+            raw.get("accountId") != adapter.native_config.account_id
+            or not quoted_sticker_candidate(raw)
+            or raw.get("recall") is not None
+            or adapter.state.message_status(raw["id"]) == "recalled"
+            or adapter.state.is_recalled(raw["threadId"], raw["quote"].get("serverId"))
+        ):
+            raise MediaError(
+                "recalled" if raw.get("quote", {}).get("state") == "recalled" else "unavailable",
+                media_kind="sticker",
+            )
+        current = await adapter.client.message(raw["id"])
+        if (
+            any(
+                current.get(k) != raw.get(k)
+                for k in ("id", "accountId", "threadId", "serverId", "senderId")
+            )
+            or current.get("quote") != raw.get("quote")
+            or not quoted_sticker_candidate(current)
+        ):
+            raise MediaError("unavailable", media_kind="sticker")
+        if current.get("recall") is not None:
+            raise MediaError("recalled", media_kind="sticker")
+        if source_message_id and source_message_id != raw["id"]:
+            await self._check_original_message(raw, source_message_id)
+
+    async def read_quote_with_source(self, raw, *, original=False, guard=None):
+        try:
+            async with asyncio.timeout(self.adapter.client.media_timeout):
+                if guard:
+                    guard()
+                source_message_id, is_embedded = await self._resolve_quote_source(raw)
+                await self.check_quote(raw, source_message_id=source_message_id)
+                assets = await self.adapter.client.sticker_assets(
+                    source_message_id, quoted=is_embedded
+                )
+                candidates = [a for a in assets if not original or a.get("variant") == "original"]
+                if not candidates:
+                    raise MediaError("unsupported_format", media_kind="sticker")
+                asset = sorted(candidates, key=lambda a: a.get("variant") != "original")[0]
+                if asset.get("state") == "pending":
+                    await self.transfer(raw, asset, source_message_id=source_message_id)
+                    assets = await self.adapter.client.sticker_assets(
+                        source_message_id, quoted=is_embedded
+                    )
+                    asset = next((a for a in assets if a["id"] == asset["id"]), None)
+                    if asset is None:
+                        raise MediaError("unavailable", media_kind="sticker")
+                data = await self.adapter.client.sticker_content(asset, original=original)
+                refreshed = await self.adapter.client.sticker_assets(
+                    source_message_id, quoted=is_embedded
+                )
+                latest = next((a for a in refreshed if a["id"] == asset["id"]), None)
+                if not latest or any(
+                    latest.get(k) != asset.get(k)
+                    for k in (
+                        "kind",
+                        "variant",
+                        "actualVariant",
+                        "state",
+                        "sha256",
+                        "byteLength",
+                        "preview",
+                    )
+                ):
+                    raise MediaError("unavailable", media_kind="sticker")
+                await self.check_quote(raw, source_message_id=source_message_id)
+                if guard:
+                    guard()
+                return data, asset, source_message_id
+        except NativeAPIError as error:
+            from .native_client import _map_media_code
+
+            raise _map_media_code(
+                error.code, quoted=True, status=error.status, media_kind="sticker"
+            ) from None
+        except TimeoutError:
+            raise MediaError("unavailable", media_kind="sticker") from None
+
+    async def read_quote(self, raw, *, original=False, guard=None):
+        data, asset, _ = await self.read_quote_with_source(raw, original=original, guard=guard)
+        return data, asset
+
+    def claim(self, raw, action, content_id, source):
+        digest = source_hash(source)
+        key = "astrbot-sticker-" + source_hash(
+            [
+                self.adapter.native_config.api_url,
+                raw["accountId"],
+                raw["threadId"],
+                raw["id"],
+                action,
+                digest,
+            ]
+        )
+        return self.adapter.state.claim_sticker(
+            raw["accountId"],
+            raw["threadId"],
+            raw["id"],
+            action,
+            content_id,
+            key,
+            digest,
+            time.time(),
+        )
+
+    def log_acquisition(self, row, stage, job=None, error=None):
+        """Log only receipt identity, known enums/codes and comparison booleans."""
+        job = job if isinstance(job, dict) else {}
+        native_state, phase = job.get("state"), job.get("phase")
+        reason = job.get("reason")
+        code = (
+            reason
+            if isinstance(reason, str) and reason in _SAFE_CODES
+            else _extract_job_error_code(job)
+        )
+        native_state = (
+            native_state
+            if isinstance(native_state, str)
+            and native_state
+            in {
+                "queued",
+                "running",
+                "available",
+                "needs_review",
+                "failed",
+                "cancelled",
+                "expired",
+                "unsupported",
+            }
+            else "unknown"
+        )
+        phase = (
+            phase
+            if isinstance(phase, str)
+            and phase
+            in {
+                "queued",
+                "preparing",
+                "downloading",
+                "reserving",
+                "uploading",
+                "submitting",
+                "readback",
+                "projecting",
+                "completed",
+            }
+            else "unknown"
+        )
+        code = code if isinstance(code, str) and code in _SAFE_CODES else "unknown"
+        identity_matches = (
+            job.get("accountId") == row["account"]
+            and job.get("kind") == "sticker_acquire"
+            and isinstance(job.get("id"), str)
+            and bool(job["id"])
+            and (not row["job_id"] or job["id"] == row["job_id"])
+        )
+        payload = job.get("result")
+        payload = payload if isinstance(payload, dict) else {}
+        acceptance = payload.get("serverAcceptance")
+        acceptance = (
+            acceptance
+            if isinstance(acceptance, str)
+            and acceptance
+            in {
+                "pending",
+                "accepted",
+                "not_attempted",
+                "rejected",
+                "reconciled_noop",
+            }
+            else "unknown"
+        )
+        logger.warning(
+            "WeChat Native 表情获取诊断：stage=%s http=%s code=%s "
+            "receipt_key=%s job_id=%s identity_matches=%s native_state=%s "
+            "native_phase=%s native_code=%s acceptance=%s error_type=%s",
+            stage,
+            error.status if isinstance(error, NativeAPIError) else None,
+            error.code if isinstance(error, NativeAPIError) else "none",
+            row["idempotency_key"],
+            job["id"] if identity_matches else row["job_id"],
+            identity_matches,
+            native_state,
+            phase,
+            code,
+            acceptance,
+            type(error).__name__ if error else "none",
+        )
+
+    async def inspect(self, row, job=None):
+        action, key = row["action"], row["idempotency_key"]
+        if action.startswith("library:"):
+            from .sticker_commands import inspect_library_operation
+
+            return await inspect_library_operation(self.adapter, row, job)
+        acquiring = action.startswith("acquire:")
+        if action == "send":
+            return await self.inspect_send(row)
+        if row["state"] in {"success", "already_saved", "failed"}:
+            return result(action, row["state"])
+        state = "needs_review"
+        job_id = row["job_id"]
+        server_id = None
+        try:
+            if job is None:
+                if not job_id:
+                    if acquiring:
+                        self.log_acquisition(row, "missing_receipt")
+                    return result(action, state)
+                job = await self.adapter.client.job(job_id)
+            expected_kind = (
+                "sticker_acquire"
+                if acquiring
+                else "sticker_saved"
+                if action == "save"
+                else "download"
+            )
+            if (
+                not isinstance(job, dict)
+                or job.get("accountId") != row["account"]
+                or job.get("kind") != expected_kind
+                or not isinstance(job.get("id"), str)
+                or not job["id"]
+                or (job_id and job["id"] != job_id)
+                or (action.startswith("transfer:") and job.get("assetId") != row["content_id"])
+            ):
+                raise ToolError("needs_review")
+            job_id = job["id"]
+            payload = job.get("result") or {}
+            if job.get("state") == "available" and job.get("phase") == "completed":
+                if acquiring:
+                    if (
+                        payload.get("packId") == action.removeprefix("acquire:")
+                        and payload.get("serverAcceptance") == "accepted"
+                        and payload.get("contentReadiness") == "available"
+                        and isinstance(payload.get("items"), list)
+                        and any(self.pack_original_ready(a) for a in payload["items"])
+                    ):
+                        state = "success"
+                elif action.startswith("transfer:") or (
+                    payload.get("profileWriteback") == "complete"
+                    and payload.get("serverAcceptance") in {"accepted", "reconciled_noop"}
+                ):
+                    state = "success"
+            elif job.get("state") in {"queued", "running"}:
+                state = "pending"
+            elif job.get("state") in {"failed", "cancelled", "expired", "unsupported"}:
+                if (
+                    acquiring
+                    or action.startswith("transfer:")
+                    or payload.get("serverAcceptance") in {"not_attempted", "rejected"}
+                ):
+                    state = "failed"
+        except (NativeAPIError, ToolError, TypeError, AttributeError) as error:
+            if acquiring and isinstance(error, NativeAPIError):
+                self.log_acquisition(row, "job_read", error=error)
+            state = "needs_review"
+        self.adapter.state.finish_sticker(key, state, job_id, server_id)
+        if acquiring and state in {"needs_review", "failed"}:
+            self.log_acquisition(row, "job_result", job)
+        return result(action, state)
+
+    async def transfer(self, raw, asset, *, source_message_id=None):
+        target_id = source_message_id or raw["id"]
+        row, won = self.claim(
+            raw,
+            "transfer:" + asset["id"],
+            asset["id"],
+            {
+                "messageId": target_id,
+                "assetId": asset["id"],
+                "quality": "original",
+            },
+        )
+        try:
+            active_job = asset.get("jobId")
+            if won and isinstance(active_job, str) and active_job:
+                self.adapter.state.finish_sticker(row["idempotency_key"], "pending", active_job)
+                row = {**row, "job_id": active_job}
+                outcome = await self.inspect(row)
+            elif won:
+                job = await self.adapter.client.transfer_media(
+                    target_id,
+                    asset_id=asset["id"],
+                    key=row["idempotency_key"],
+                )
+                outcome = await self.inspect(row, job)
+            else:
+                outcome = await self.inspect(row)
+            while outcome["status"] == "pending":
+                await asyncio.sleep(self.adapter.client.poll_interval)
+                row = self.adapter.state.sticker_operation(
+                    row["account"],
+                    row["thread"],
+                    row["trigger_message_id"],
+                    row["action"],
+                )
+                outcome = await self.inspect(row)
+            if outcome["status"] != "success":
+                raise MediaError("unavailable")
+        except BaseException:
+            if won:
+                self.adapter.state.finish_sticker(row["idempotency_key"], "needs_review")
+            raise
+
+    @staticmethod
+    def _merge_captions(official, local):
+        official_clean = clean_sticker_caption(official)
+        local_clean = clean_sticker_caption(local)
+        if not local_clean:
+            return official_clean
+        if not official_clean:
+            return local_clean
+        if local_clean.casefold() in official_clean.casefold():
+            return official_clean
+        if official_clean.casefold() in local_clean.casefold():
+            return local_clean
+        return f"{official_clean} {local_clean}"[:160]
+
+    async def _generate_caption(self, labeler, data, *, is_preview=False):
+        if not callable(labeler) or not data:
+            return ""
+        try:
+            preview_bytes = data if is_preview else await asyncio.to_thread(sticker_preview, data)
+            async with asyncio.timeout(10):
+                return clean_sticker_caption(await labeler(preview_bytes))
+        except Exception:
+            return ""
+
+    async def recover(self):
+        """Read retained jobs, including legacy saves; never submit new operations."""
+        for row in self.adapter.state.pending_stickers(self.adapter.native_config.account_id):
+            await self.inspect(row)
+
+    async def _saved_original(self, item, label_row, *, allow_detail=True):
+        account = self.adapter.native_config.account_id
+        sid = item["id"]
+        inline = item.get("original")
+        if isinstance(inline, dict):
+            ready = self.original_gif_ready(inline)
+            self.adapter.state.upsert_sticker_label(
+                account,
+                sid,
+                ready_gif=ready,
+                content_type=str(inline.get("contentType") or ""),
+            )
+            return ready, inline, False
+        if label_row and label_row["ready_gif"] == 1:
+            return True, None, False
+        if not allow_detail:
+            return False, None, False
+        try:
+            detail = await NativeClient.custom_sticker(self.adapter.client, sid)
+        except NativeAPIError as error:
+            if error.status in {401, 403}:
+                raise
+            return False, None, True
+        original = detail.get("original") if isinstance(detail, dict) else None
+        ready = self.original_gif_ready(original)
+        self.adapter.state.upsert_sticker_label(
+            account,
+            sid,
+            ready_gif=ready,
+            content_type=str(original.get("contentType") or "")
+            if isinstance(original, dict)
+            else "",
+        )
+        return ready, original, True
+
+    async def _autolabel_saved(self, sid, original, labeler):
+        if not callable(labeler):
+            return ""
+        try:
+            if original is None:
+                detail = await NativeClient.custom_sticker(self.adapter.client, sid)
+                original = detail.get("original") if isinstance(detail, dict) else None
+            if not self.original_gif_ready(original):
+                return ""
+            has_preview = isinstance(original.get("preview"), dict)
+            content = await NativeClient.sticker_content(
+                self.adapter.client, original, original=not has_preview
+            )
+        except (MediaError, NativeAPIError):
+            return ""
+        generated = await self._generate_caption(labeler, content, is_preview=has_preview)
+        if generated:
+            self.adapter.state.upsert_sticker_label(
+                self.adapter.native_config.account_id,
+                sid,
+                caption=generated,
+                ready_gif=True,
+                content_type="image/gif",
+            )
+        return generated
+
+    async def catalog(self, *, labeler=None, label_missing=False):
+        saved = await self.adapter.client.custom_stickers()
+        packs = await self.adapter.client.sticker_packs()
+        if not isinstance(saved.get("items"), list) or not isinstance(packs.get("items"), list):
+            raise ToolError("not_available")
+        account = self.adapter.native_config.account_id
+        labels = self.adapter.state.sticker_labels(account)
+        items = []
+        detail_budget = 50
+        label_budget = 5 if label_missing and callable(labeler) else 0
+        saved_ready = 0
+        for item in saved["items"][:100]:
+            if not isinstance(item, dict) or not re.fullmatch(
+                r"[0-9a-fA-F]{32}", str(item.get("id", ""))
+            ):
+                continue
+            sid = item["id"]
+            label_row = labels.get(sid.lower())
+            ready, original, fetched = await self._saved_original(
+                item, label_row, allow_detail=detail_budget > 0
+            )
+            if fetched:
+                detail_budget -= 1
+            if not ready:
+                continue
+            saved_ready += 1
+            caption = self._merge_captions(
+                item.get("caption") or "",
+                label_row["caption"] if label_row else "",
+            )
+            if not caption and label_budget > 0:
+                label_budget -= 1
+                generated = await self._autolabel_saved(sid, original, labeler)
+                if generated:
+                    caption = self._merge_captions(item.get("caption") or "", generated)
+            items.append(
+                {
+                    "source": {"kind": "saved", "stickerId": sid},
+                    "caption": caption,
+                    "pack_name": "",
+                }
+            )
+        # Bound metadata work; include only locally ready official GIFs (no /sticker-downloads).
+        pack_ready = 0
+        for pack in packs["items"][:50]:
+            if not isinstance(pack, dict) or pack.get("membership") != "added":
+                continue
+            pack_id = pack.get("id")
+            if not isinstance(pack_id, str) or not pack_id:
+                continue
+            page = await self.adapter.client.pack_stickers(pack_id)
+            if page.get("packId") != pack_id or not isinstance(page.get("items"), list):
+                raise ToolError("not_available")
+            for item in page["items"]:
+                if (
+                    not isinstance(item, dict)
+                    or item.get("packId") != pack_id
+                    or not re.fullmatch(r"[0-9a-fA-F]{32}", str(item.get("id", "")))
+                ):
+                    raise ToolError("not_available")
+                if not self.original_gif_ready(item.get("original")):
+                    continue
+                pack_ready += 1
+                name = pack.get("name")
+                label_row = labels.get(str(item["id"]).lower())
+                caption = self._merge_captions(
+                    item.get("caption") or "",
+                    label_row["caption"] if label_row else "",
+                )
+                items.append(
+                    {
+                        "source": {"kind": "pack", "packId": pack_id, "stickerId": item["id"]},
+                        "caption": caption,
+                        "pack_name": name if isinstance(name, str) and name != pack_id else "",
+                    }
+                )
+        diagnostics = {
+            "source": "native_profile",
+            "saved_count": len(saved["items"]),
+            "saved_ready_count": saved_ready,
+            "added_pack_count": sum(
+                isinstance(p, dict) and p.get("membership") == "added" for p in packs["items"]
+            ),
+            "pack_ready_count": pack_ready,
+            "candidate_count": len(items),
+            "native_version": None,
+        }
+        if not items:
+            try:
+                status = await self.adapter.client.status()
+                identity = status.get("version")
+                version = identity.get("version") if isinstance(identity, dict) else identity
+                if isinstance(version, str) and re.fullmatch(r"\d+\.\d+\.\d+(?:-[\w.]+)?", version):
+                    diagnostics["native_version"] = version
+            except NativeAPIError:
+                pass
+        return items, diagnostics
+
+    async def find(self, event, query="", limit=12, *, labeler=None):
+        ctx = context(event, stickers=True)
+        if (
+            not isinstance(query, str)
+            or len(query.encode()) > 256
+            or type(limit) is not int
+            or not 1 <= limit <= 12
+        ):
+            raise ToolError("invalid_request")
+        catalog, diagnostics = await self.catalog(labeler=labeler, label_missing=True)
+        context(event, stickers=True)
+        retained = event.get_extra("wechat_native_sticker_selections") or {}
+        choices = []
+        for item in catalog:
+            caption, name = str(item["caption"])[:160], item["pack_name"][:160]
+            if query and query.casefold() not in (caption + " " + name).casefold():
+                continue
+            token = uuid.uuid4().hex
+            retained[token] = {
+                "account": ctx.account,
+                "thread": ctx.thread,
+                "trigger": ctx.message_id,
+                "source": item["source"],
+                "created": time.time(),
+            }
+            choices.append(
+                {
+                    "selection_id": token,
+                    "source": item["source"]["kind"],
+                    "caption": caption,
+                    "pack_name": name,
+                }
+            )
+            if len(choices) == limit:
+                break
+        # Prevent repeated searches from growing one event indefinitely.
+        event.set_extra("wechat_native_sticker_selections", dict(list(retained.items())[-120:]))
+        output = result(
+            "find",
+            "success",
+            items=choices,
+            count=len(choices),
+            untrusted_data=True,
+            catalog=diagnostics,
+        )
+        if not choices:
+            output["reason"] = (
+                "sticker_query_no_match" if catalog else "native_sticker_catalog_empty"
+            )
+            output["message"] = (
+                "当前目录没有匹配该文字的候选，请换用简短关键词或空查询查看可用表情。"
+                if catalog
+                else "Native 当前账号目录未返回本地可用的 GIF 表情，"
+                "请先在该账号添加表情包，由管理员私聊发送 /表情包同步，再重新查找。"
+            )
+        return output
+
+    async def select_ready(self, event, source, expected_sha256):
+        """Bind a trusted local catalog choice to this event, after fresh verification."""
+        ctx = context(event, stickers=True)
+        if (not isinstance(source, dict) or source.get('kind') not in {'saved', 'pack'}
+                or not re.fullmatch(r'[0-9a-f]{32}', str(source.get('stickerId', '')))
+                or (source['kind'] == 'pack' and not isinstance(source.get('packId'), str))):
+            raise ToolError('invalid_request')
+        item = await self.validate_selection(source)
+        original = item.get('original') or {}
+        if source['kind'] == 'saved' and not original:
+            item = await self.adapter.client.custom_sticker(source['stickerId'])
+            original = item.get('original') or {}
+        if not self.original_gif_ready(original) or original.get('sha256') != expected_sha256:
+            raise ToolError('not_available', 'sticker_membership_changed')
+        context(event, stickers=True)
+        token = uuid.uuid4().hex
+        retained = event.get_extra('wechat_native_sticker_selections') or {}
+        retained[token] = {'account': ctx.account, 'thread': ctx.thread, 'trigger': ctx.message_id,
+                           'source': dict(source), 'created': time.time()}
+        event.set_extra('wechat_native_sticker_selections', dict(list(retained.items())[-120:]))
+        return token
+
+    async def validate_selection(self, source):
+        if source["kind"] == "saved":
+            page = await self.adapter.client.custom_stickers()
+            item = next(
+                (
+                    i
+                    for i in page.get("items", [])
+                    if isinstance(i, dict) and i.get("id") == source["stickerId"]
+                ),
+                None,
+            )
+            if item is None:
+                raise ToolError("not_available", "sticker_membership_changed")
+            original = item.get("original")
+            if not isinstance(original, dict):
+                detail = await NativeClient.custom_sticker(self.adapter.client, source["stickerId"])
+                original = detail.get("original") if isinstance(detail, dict) else None
+            ready = self.original_gif_ready(original)
+            self.adapter.state.upsert_sticker_label(
+                self.adapter.native_config.account_id,
+                source["stickerId"],
+                ready_gif=ready,
+                content_type=str(original.get("contentType") or "")
+                if isinstance(original, dict)
+                else "",
+            )
+            if not ready:
+                raise ToolError("not_available", "sticker_saved_original_unavailable")
+            return item
+        packs = await self.adapter.client.sticker_packs()
+        valid = any(
+            isinstance(p, dict)
+            and p.get("id") == source["packId"]
+            and p.get("membership") == "added"
+            for p in packs.get("items", [])
+        )
+        item = None
+        if valid:
+            page = await self.adapter.client.pack_stickers(source["packId"])
+            item = next(
+                (
+                    i
+                    for i in page.get("items", [])
+                    if isinstance(i, dict)
+                    and i.get("id") == source["stickerId"]
+                    and i.get("packId") == source["packId"]
+                ),
+                None,
+            )
+            valid = page.get("packId") == source["packId"] and item is not None
+        if not valid:
+            raise ToolError("not_available", "sticker_membership_changed")
+        if not self.original_gif_ready(item.get("original")):
+            raise ToolError("not_available", "sticker_pack_original_unavailable")
+        return item
+
+    def original_gif_ready(self, asset):
+        return (
+            isinstance(asset, dict)
+            and isinstance(asset.get("id"), str)
+            and bool(asset["id"])
+            and asset.get("accountId") == self.adapter.native_config.account_id
+            and asset.get("messageId") is None
+            and asset.get("kind") == "sticker"
+            and asset.get("variant") == "original"
+            and asset.get("actualVariant") == "original"
+            and asset.get("state") == "available"
+            and asset.get("contentType") == "image/gif"
+            and type(asset.get("byteLength")) is int
+            and 0 < asset["byteLength"] <= MAX_IMAGE_BYTES
+            and isinstance(asset.get("sha256"), str)
+            and re.fullmatch(r"[0-9a-fA-F]{64}", asset["sha256"]) is not None
+        )
+
+    def pack_original_ready(self, asset):
+        return self.original_gif_ready(asset)
+
+    async def inspect_send(self, row):
+        key = row["idempotency_key"]
+        if row["state"] in {"success", "failed"}:
+            return result("send", row["state"])
+        try:
+            receipt = await self.adapter.client.sticker_send_receipt(
+                row["thread"],
+                key,
+                job_id=row["job_id"],
+                record_job=lambda job_id: self.adapter.state.finish_sticker(key, "pending", job_id),
+            )
+        except SendError as error:
+            state = "failed" if error.state == "failed" else "needs_review"
+            self.adapter.state.finish_sticker(key, state, error.send_id)
+            return result("send", state)
+        self.adapter.state.complete_sticker_send(key, receipt["id"], receipt["serverMessageId"])
+        self.adapter.loop_guard.outgoing(row["thread"], key, "", trigger=row["trigger_message_id"])
+        return result("send", "success")
+
+    async def send(self, event, selection_id):
+        def finish_outcome(outcome):
+            if outcome.get("status") in {"success", "pending", "submitting", "needs_review"}:
+                event.set_extra("wechat_native_sticker_suppress_followup", True)
+            return outcome
+
+        ctx = context(event, stickers=True, sticker_recovery=True)
+        existing = self.adapter.state.sticker_operation(
+            ctx.account, ctx.thread, ctx.message_id, "send"
+        )
+        if existing:
+            return finish_outcome(await self.inspect_send(existing))
+        selections = event.get_extra("wechat_native_sticker_selections") or {}
+        selection = selections.get(selection_id) if isinstance(selection_id, str) else None
+        if (
+            not selection
+            or (selection["account"], selection["thread"], selection["trigger"])
+            != (ctx.account, ctx.thread, ctx.message_id)
+            or time.time() - selection["created"] > 300
+        ):
+            raise ToolError("invalid_request", "sticker_selection_expired")
+        source = selection["source"]
+        await self.validate_selection(source)
+        context(event, stickers=True)
+        raw = event.message_obj.raw_message
+        row, won = self.claim(raw, "send", source["stickerId"], source)
+        if row is None:
+            raise ToolError("rate_limited")
+        if not won:
+            return finish_outcome(await self.inspect_send(row))
+        key = row["idempotency_key"]
+        try:
+            sent = await self.adapter.send_chain(
+                ctx.thread,
+                None,
+                source=raw,
+                event=event,
+                sticker=source,
+                sticker_key=key,
+            )
+            if not sent:
+                self.adapter.state.finish_sticker(key, "failed")
+                return result("send", "failed")
+        except BaseException as error:
+            record = self.adapter.state.send_record(key)
+            state = (
+                "failed"
+                if not record
+                or record["state"] == "failed"
+                or isinstance(error, ValueError)
+                or (isinstance(error, SendError) and error.state == "failed")
+                else "needs_review"
+            )
+            self.adapter.state.finish_sticker(key, state)
+            if isinstance(error, asyncio.CancelledError) or is_tool_error(error):
+                raise
+            fields = {}
+            if state == "failed" and isinstance(error, NativeAPIError):
+                fields = {
+                    "reason": error.code,
+                    "message": "Native 已明确拒绝这次表情发送，未发送成功。",
+                }
+            return finish_outcome(result("send", state, **fields))
+        return finish_outcome(
+            await self.inspect_send(
+                self.adapter.state.sticker_operation(
+                    ctx.account, ctx.thread, ctx.message_id, "send"
+                )
+            )
+        )
