@@ -130,12 +130,13 @@ class ChannelsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(scope['link_card_text']({**self.source,'recall':{'state':'recalled'}}),'')
 
     def test_native_private_card_accepted_and_group_whitelist_preserved(self):
+        from plugins.astrbot_plugin_wechat_native.peer_filter import blocked_private_peer
         tree=ast.parse((ROOT/'plugins/astrbot_plugin_wechat_native/adapter.py').read_text(encoding='utf-8'))
         cls=next(n for n in tree.body if isinstance(n,ast.ClassDef) and any(isinstance(f,ast.FunctionDef) and f.name=='_classify' for f in n.body))
         function=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='_classify')
         scope={'logger':Mock(),'RED_PACKET_APP_TYPES':set(),'quoted_sticker_candidate':lambda raw:False,'is_sticker':lambda raw:False,
             'is_pdf_filename':lambda name:False,'link_card_text':lambda raw:'[视频号卡片]' if raw.get('appMessageType')==51 else '',
-            'is_summary_command':lambda text:False,'re':__import__('re')}
+            'is_summary_command':lambda text:False,'re':__import__('re'),'blocked_private_peer':blocked_private_peer}
         exec(compile(ast.Module(body=[function],type_ignores=[]),'classify-function','exec'),scope)
         cfg=types.SimpleNamespace(enable_media=True,enable_stickers=True,enable_private_reply=True,allowed_users=set(),group_reply_mode='mention',allowed_groups={'group@chatroom'})
         adapter=types.SimpleNamespace(bot_self_id='bot',native_config=cfg,_check_timestamp=lambda raw:True)

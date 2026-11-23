@@ -67,6 +67,7 @@ from .sticker_service import StickerService, quoted_sticker_candidate, is_sticke
 from .output_text import visible_text, has_tool_markup, reply_fallback
 from .summary import GroupSummaryCache, is_summary_command
 from .wechat_actions import WeChatActions
+from .peer_filter import blocked_private_peer, prime_private_peer_filter
 
 RED_PACKET_COOLDOWN = 30
 # A deployed Native instance reported a confirmed group red packet as app subtype 47.
@@ -241,6 +242,8 @@ class WeChatNativeAdapter(Platform):
             return ignored("self_message")
         if not isinstance(raw.get("senderId"), str) or not raw["senderId"]:
             return ignored("missing_sender")
+        if blocked_private_peer(raw,self):
+            return ignored("official_private_peer")
         cfg = self.native_config
         msg_type = raw.get("type")
         if msg_type == 49 and raw.get("appMessageType") in RED_PACKET_APP_TYPES:
@@ -1046,6 +1049,8 @@ class WeChatNativeAdapter(Platform):
                 cursor, message_id, thread, raw.get("serverId"), "ignored", received=received
             )
             return
+        if origin == "live":
+            await prime_private_peer_filter(self,raw)
         kind = self._classify(raw, origin)
         logger.debug(
             "WeChat Native 消息分类：message=%s type=%s app_type=%s direction=%s "

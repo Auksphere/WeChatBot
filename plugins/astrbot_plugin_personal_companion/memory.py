@@ -37,9 +37,12 @@ class MemoryStore:
                 ON CONFLICT(account,user) DO UPDATE SET nickname=CASE WHEN users.enabled=0 THEN '' WHEN excluded.nickname='' THEN users.nickname ELSE excluded.nickname END,updated=excluded.updated''',
                 (account, user, str(nickname)[:80], time.time()))
 
-    def merge(self, account, user, facts):
-        profile = self.get(account, user)
-        if not profile['enabled']:
+    def merge(self, account, user, facts, *, expected_facts=None):
+        row=self.db.execute('SELECT facts,enabled FROM users WHERE account=? AND user=?',(account,user)).fetchone()
+        if not row or not row[1]:
+            return {}
+        current=json.loads(row[0])
+        if expected_facts is not None and current!=expected_facts:
             return {}
         clean = {}
         if isinstance(facts, dict):
@@ -48,11 +51,11 @@ class MemoryStore:
                     continue
                 if key in FIELDS and isinstance(value, str) and value.strip():
                     clean[key] = value.strip()[:240]
-        profile['facts'].update(clean)
+        current.update(clean)
         with self.db:
-            self.db.execute('UPDATE users SET facts=?,updated=? WHERE account=? AND user=?',
-                            (json.dumps(profile['facts'], ensure_ascii=False), time.time(), account, user))
-        return clean
+            changed=self.db.execute('UPDATE users SET facts=?,updated=? WHERE account=? AND user=? AND enabled=1 AND facts=?',
+                            (json.dumps(current, ensure_ascii=False), time.time(), account, user,row[0])).rowcount
+        return clean if changed else {}
 
     def set_status(self, account, user, state):
         with self.db:

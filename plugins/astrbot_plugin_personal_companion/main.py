@@ -290,11 +290,12 @@ class PersonalCompanion(Star):
                 return
             try:
                 provider = await self.context.get_current_chat_provider_id(event.unified_msg_origin)
+                before_facts=self.memory.get(*identity)['facts']
                 result = await asyncio.wait_for(self.context.llm_generate(
                     chat_provider_id=provider, system_prompt=EXTRACT_PROMPT,
-                    prompt=json.dumps({'已有本人档案':self.memory.get(*identity)['facts'], '本人当前消息': text}, ensure_ascii=False),
+                    prompt=json.dumps({'已有本人档案':before_facts, '本人当前消息': text}, ensure_ascii=False),
                     max_tokens=500), timeout=18)
-                saved = self.memory.merge(*identity, parse_facts(result.completion_text))
+                saved = self.memory.merge(*identity, parse_facts(result.completion_text),expected_facts=before_facts)
                 self.memory.set_status(*identity, 'saved' if saved else 'empty')
                 return 'saved' if saved else 'empty'
             except Exception as exc:

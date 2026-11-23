@@ -2,6 +2,10 @@
 import re
 
 from astrbot.api.message_components import At, Plain
+try:
+    from ..astrbot_plugin_wechat_native.peer_filter import blocked_private_peer
+except ImportError:
+    from astrbot_plugin_wechat_native.peer_filter import blocked_private_peer
 
 # Exact alias, with a word boundary, accepts spaces, WeChat U+2005 and punctuation.
 TEXT_AT = re.compile(r'(?<![A-Za-z0-9_@＠])[@＠]大肥鱼(?![\w\u3400-\u9fff])')
@@ -35,6 +39,7 @@ def private_request(raw,adapter):
     cfg=adapter.native_config
     sender,thread=raw.get('senderId'),raw.get('threadId')
     return bool(getattr(cfg,'enable_private_reply',False)
+        and not blocked_private_peer(raw,adapter)
         and raw.get('accountId')==cfg.account_id and raw.get('direction')=='incoming'
         and raw.get('recall') is None and isinstance(sender,str) and sender
         and sender!=adapter.bot_self_id and thread==sender and not thread.endswith('@chatroom')

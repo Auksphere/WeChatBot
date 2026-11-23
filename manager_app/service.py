@@ -514,7 +514,38 @@ class Service:
                 'AND (user LIKE ? OR nickname LIKE ?) ORDER BY updated DESC LIMIT 100',
                 (account, '%' + query[:128] + '%', '%' + query[:128] + '%')).fetchall()
         return {'items': [{'id': r[0], 'nickname': r[1] or '昵称暂未获取', 'facts': json.loads(r[2]),
-            'enabled': bool(r[3]), 'updated': r[4]} for r in rows]}
+            'enabled': bool(r[3]), 'updated': r[4],
+            'revision': self.memory_revision(account, r[0], json.loads(r[2]), bool(r[3]))} for r in rows]}
+
+    @staticmethod
+    def memory_revision(account, user, facts, enabled):
+        value=json.dumps([account,user,facts,enabled],ensure_ascii=False,sort_keys=True,separators=(',',':'))
+        return hashlib.sha256(value.encode('utf-8')).hexdigest()
+
+    def edit_memory(self, payload):
+        user, facts, revision=payload.get('user'),payload.get('facts'),payload.get('revision')
+        fields={'称呼','职业或专业','兴趣','交流偏好','长期目标','相处设定'}
+        if (not isinstance(user,str) or not 1<=len(user)<=256 or any(ord(c)<32 for c in user)
+                or not isinstance(facts,dict) or not set(facts)<=fields
+                or not isinstance(revision,str) or re.fullmatch(r'[0-9a-f]{64}',revision) is None):
+            raise UserError('记忆编辑参数无效，请刷新后重试。')
+        if any(not isinstance(v,str) or len(v)>240 for v in facts.values()):
+            raise UserError('每项记忆需为文字，最多 240 字。')
+        clean={k:v.strip() for k,v in facts.items() if v.strip()}
+        path=self.companion/'people.sqlite3'
+        if not path.exists():raise UserError('用户档案不存在。')
+        account=self.config()[1]['account_id']
+        with contextlib.closing(sqlite3.connect(path,timeout=5)) as db:
+            with db:
+                db.execute('BEGIN IMMEDIATE')
+                row=db.execute('SELECT facts,enabled FROM users WHERE account=? AND user=?',(account,user)).fetchone()
+                if row is None:raise UserError('用户档案不存在。')
+                if not row[1]:raise UserError('该用户已停用记忆，请先开启记录后再编辑。')
+                if self.memory_revision(account,user,json.loads(row[0]),bool(row[1]))!=revision:
+                    raise UserError('该档案已有更新，请取消编辑并刷新后再修改，避免覆盖新资料。')
+                db.execute('UPDATE users SET facts=?,updated=? WHERE account=? AND user=?',
+                    (json.dumps(clean,ensure_ascii=False),time.time(),account,user))
+        return {'message':'记忆已保存，下次聊天立即使用新资料'}
 
     def memory_action(self, payload):
         user, action = payload.get('user'), payload.get('action')

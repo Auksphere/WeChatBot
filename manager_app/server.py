@@ -216,6 +216,7 @@ class Handler(BaseHTTPRequestHandler):
                 '/api/stickers/sync': ('同步手机表情库', service.sync_stickers),
                 '/api/stickers/discover': ('更新免费表情包', service.discover_stickers),
                 '/api/memories/action': ('更新用户记忆', lambda: service.memory_action(payload)),
+                '/api/memories/edit': ('保存个人记忆', lambda: service.edit_memory(payload)),
                 '/api/login/start': ('微信扫码登录', service.start_login)}
             if path in routes:
                 title, function = routes[path]
