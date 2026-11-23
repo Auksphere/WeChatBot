@@ -29,7 +29,7 @@ class ManagerTests(unittest.TestCase):
         shutil.copyfile(PROJECT / 'runtime_scripts/group_manager.py', self.root / 'group_manager.py')
         config = {'platform': [{'id': 'wechat-rolebot', 'account_id': 'fake-account', 'allowed_groups': ['fake@chatroom'],
             'enable_private_reply': True, 'unique_session': True}],
-            'provider_sources': [{'id': 'deepseek', 'key': ['sk-example-secret-for-tests-only']}],
+            'provider_sources': [{'id': 'deepseek', 'key': ['fixture-deepseek-key-for-tests-only']}],
             'provider': [{'id': 'deepseek-rolechat', 'model': 'deepseek-flash'}], 'provider_settings': {}}
         (self.root / 'data/cmd_config.json').write_text(json.dumps(config), encoding='utf-8-sig')
         with contextlib.closing(sqlite3.connect(self.root / 'data/data_v4.db')) as db:
@@ -120,7 +120,7 @@ class ManagerTests(unittest.TestCase):
         config, bot = self.service.config()
         self.assertEqual(bot['allowed_groups'], ['fake@chatroom'])
         self.assertFalse(bot['enable_private_reply'])
-        self.assertEqual(config['provider_sources'][0]['key'], ['sk-example-secret-for-tests-only'])
+        self.assertEqual(config['provider_sources'][0]['key'], ['fixture-deepseek-key-for-tests-only'])
         self.assertTrue(list((self.root / 'data/config-backups').glob('*.json')))
 
     def test_config_failure_restores_original(self):
